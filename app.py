@@ -11,7 +11,8 @@ st.title("Gene–Gene Spearman Correlation Explorer (with clinical filtering)")
 st.write(
     "Upload:\n"
     "1) **Expression matrix (.csv.gz)**: Column 1 = gene names; other columns = sample IDs.\n"
-    "2) **Clinical table (.csv)**: Each row = patient/sample. Filter patients (continuous vars by quartiles), then run correlations."
+    "2) **Clinical table (.csv)**: Each row = patient/sample. Filter patients (continuous vars by quartiles), then run correlations.\n\n"
+    "Note: Duplicate gene names in expression data are collapsed by **mean**."
 )
 
 # -----------------------------
@@ -118,35 +119,33 @@ clin_file = st.file_uploader("2) Upload clinical table (.csv) (optional but need
 
 colA, colB = st.columns([1, 1])
 with colA:
-    if st.button("Next →", disabled=(expr_file is None)):
+    if st.button("Next →", key="next_step1", disabled=(expr_file is None)):
         go(2)
 
 if expr_file is None:
     st.stop()
 
-# Load expression early (cached) so later steps are fast/stable
 df_expr = load_expression_gz(expr_file.getvalue())
 gene_col = df_expr.columns[0]
 expr_samples = pd.Index(df_expr.columns[1:]).astype(str)
-
 st.caption(f"Expression loaded • Genes: {df_expr.shape[0]:,} • Samples: {len(expr_samples):,}")
 
 if st.session_state.step < 2:
     st.stop()
 
 # -----------------------------
-# STEP 2: Clinical mapping (if provided)
+# STEP 2: Clinical mapping
 # -----------------------------
 st.header("Step 2 — Clinical mapping (optional)")
 
 df_clin = None
 id_col = None
-overlap_samples = expr_samples
+overlap = expr_samples
 
 if clin_file is None:
     st.info("No clinical file uploaded. You can still run correlations on all samples.")
-    if st.button("Next →"):
-        go(4)  # skip to gene/correlation step
+    if st.button("Next →", key="next_step2_no_clin"):
+        go(5)  # jump to gene/settings
     st.stop()
 
 df_clin = load_clinical_csv(clin_file.getvalue()).copy()
@@ -154,7 +153,7 @@ df_clin = load_clinical_csv(clin_file.getvalue()).copy()
 id_col = st.selectbox(
     "Select the clinical column that contains sample IDs matching expression columns",
     options=list(df_clin.columns),
-    key="id_col",
+    key="id_col_select",
 )
 
 df_clin[id_col] = df_clin[id_col].astype(str)
@@ -165,14 +164,14 @@ if len(overlap) == 0:
     st.error("No overlapping sample IDs between clinical table and expression matrix.")
     st.stop()
 
-if st.button("Next →"):
+if st.button("Next →", key="next_step2"):
     go(3)
 
 if st.session_state.step < 3:
     st.stop()
 
 # -----------------------------
-# STEP 3: Choose variables to filter on (no filtering applied yet)
+# STEP 3: Choose variables
 # -----------------------------
 st.header("Step 3 — Choose clinical variables to filter on")
 
@@ -181,27 +180,29 @@ chosen_vars = st.multiselect(
     "Select variables to filter on (you'll configure filters in the next step)",
     options=candidate_vars,
     default=st.session_state.get("chosen_vars", []),
-    key="chosen_vars",
+    key="chosen_vars_select",
 )
 
-if st.button("Next →"):
-    go(4)
+c1, c2 = st.columns([1, 1])
+with c1:
+    if st.button("Back ←", key="back_step3"):
+        go(2)
+with c2:
+    if st.button("Next →", key="next_step3"):
+        go(4)
 
 if st.session_state.step < 4:
     st.stop()
 
 # -----------------------------
-# STEP 4: Configure filters + apply (still no correlation run)
+# STEP 4: Configure + apply filters
 # -----------------------------
-st.header("Step 4 — Configure filters and apply to patients")
+st.header("Step 4 — Configure filters and apply")
 
-# Restrict clinical to overlapping samples
 df_clin2 = df_clin[df_clin[id_col].isin(overlap)].reset_index(drop=True).copy()
 
 filters = st.session_state.get("filters", {})
 new_filters = {}
-
-st.write("Set filters below, then click **Apply filters →**. The correlation analysis will not run until Step 6.")
 
 for var in chosen_vars:
     s = df_clin2[var]
@@ -213,7 +214,7 @@ for var in chosen_vars:
             f"Quartiles for {var} (Q1=lowest, Q4=highest)",
             options=[1, 2, 3, 4],
             default=prev.get("quartiles", [1, 2, 3, 4]),
-            key=f"q_{var}",
+            key=f"quart_{var}",
         )
         new_filters[var] = {"type": "quartiles", "quartiles": q_choice}
     else:
@@ -227,17 +228,16 @@ for var in chosen_vars:
             f"Keep values for {var}",
             options=options,
             default=prev.get("values", options),
-            key=f"c_{var}",
+            key=f"cat_{var}",
         )
         new_filters[var] = {"type": "categorical", "values": picked}
 
-apply_clicked = st.button("Apply filters →")
+apply_clicked = st.button("Apply filters →", key="apply_filters_step4")
 
 if apply_clicked:
     st.session_state.filters = new_filters
 
     keep = pd.Series(True, index=df_clin2.index)
-
     for var, spec in new_filters.items():
         s = df_clin2[var]
         if spec["type"] == "quartiles":
@@ -256,25 +256,25 @@ if apply_clicked:
 
     kept_ids = pd.Index(df_clin2.loc[keep, id_col].astype(str))
     filtered_samples = expr_samples.intersection(kept_ids)
-
     st.session_state.filtered_samples = list(filtered_samples)
     st.success(f"Filters applied. Patients kept: {len(filtered_samples):,}")
 
-# Show current filtered count (if applied)
 current_filtered = st.session_state.get("filtered_samples", None)
-if current_filtered is None:
-    st.info("No filters applied yet in this step. Click **Apply filters →** to finalize the patient subset.")
+if current_filtered is None and len(chosen_vars) > 0:
+    st.info("Click **Apply filters →** to finalize the patient subset.")
 else:
-    st.caption(f"Current filtered patients: {len(current_filtered):,}")
+    if current_filtered is None:
+        st.caption(f"No filters chosen. Using overlap samples: {len(overlap):,}")
+    else:
+        st.caption(f"Current filtered patients: {len(current_filtered):,}")
 
-col1, col2 = st.columns([1, 1])
-with col1:
-    if st.button("Back ←"):
+c1, c2 = st.columns([1, 1])
+with c1:
+    if st.button("Back ←", key="back_step4"):
         go(3)
-with col2:
-    # allow next if filters are applied OR no chosen vars (i.e., overlap-only)
-    can_next = (current_filtered is not None) or (len(chosen_vars) == 0)
-    if st.button("Next →", disabled=not can_next):
+with c2:
+    can_next = (len(chosen_vars) == 0) or (current_filtered is not None)
+    if st.button("Next →", key="next_step4", disabled=not can_next):
         go(5)
 
 if st.session_state.step < 5:
@@ -283,20 +283,16 @@ if st.session_state.step < 5:
 # -----------------------------
 # STEP 5: Select gene + settings
 # -----------------------------
-st.header("Step 5 — Choose gene and settings (analysis still not running)")
+st.header("Step 5 — Choose gene and settings")
 
-if clin_file is None:
-    filtered_samples = list(expr_samples)
+if len(chosen_vars) == 0:
+    filtered_samples = list(overlap)
 else:
-    if len(chosen_vars) == 0:
-        filtered_samples = list(overlap)  # overlap-only
-    else:
-        filtered_samples = st.session_state.get("filtered_samples", [])
-        if not filtered_samples:
-            st.error("No patients available after filtering. Go back and relax filters.")
-            st.stop()
+    filtered_samples = st.session_state.get("filtered_samples", [])
+    if not filtered_samples:
+        st.error("No patients available after filtering. Go back and relax filters.")
+        st.stop()
 
-# Keep expression columns in original order
 filtered_samples_ordered = [c for c in df_expr.columns[1:] if str(c) in set(filtered_samples)]
 if len(filtered_samples_ordered) < 3:
     st.error("Too few patients to compute correlations. Go back and relax filters.")
@@ -307,34 +303,33 @@ genes = df_expr_filt[gene_col].astype(str).tolist()
 
 st.caption(f"Patients used for correlation: {len(filtered_samples_ordered):,}")
 
-selected_gene = st.selectbox("Search and select a gene", options=genes, key="sel_gene")
+selected_gene = st.selectbox("Search and select a gene", options=genes, key="sel_gene_step5")
 min_pairs = st.number_input(
     "Minimum paired samples (non-missing) required per correlation",
     min_value=3,
     max_value=5000,
     value=min(10, len(filtered_samples_ordered)),
     step=1,
-    key="min_pairs",
+    key="min_pairs_step5",
 )
 
-col1, col2 = st.columns([1, 1])
-with col1:
-    if st.button("Back ←"):
+c1, c2 = st.columns([1, 1])
+with c1:
+    if st.button("Back ←", key="back_step5"):
         go(4)
-with col2:
-    if st.button("Next →"):
+with c2:
+    if st.button("Next →", key="next_step5"):
         go(6)
 
 if st.session_state.step < 6:
     st.stop()
 
 # -----------------------------
-# STEP 6: Run analysis (only here)
+# STEP 6: Run analysis
 # -----------------------------
 st.header("Step 6 — Run genome-wide correlation")
 
-run = st.button("Run correlation analysis now")
-
+run = st.button("Run correlation analysis now", key="run_step6")
 if not run:
     st.stop()
 
@@ -342,8 +337,8 @@ with st.spinner("Computing Spearman correlations…"):
     res = compute_spearman_all(
         df_expr=df_expr_filt,
         gene_col=gene_col,
-        selected_gene=st.session_state.sel_gene,
-        min_pairs=int(st.session_state.min_pairs),
+        selected_gene=st.session_state["sel_gene_step5"],
+        min_pairs=int(st.session_state["min_pairs_step5"]),
     )
 
 st.success(f"Done. Computed correlations for {res.shape[0]:,} genes.")
@@ -352,13 +347,12 @@ st.dataframe(res, use_container_width=True, height=600)
 st.download_button(
     "Download results CSV",
     data=res.to_csv(index=False).encode("utf-8"),
-    file_name=f"{st.session_state.sel_gene}_spearman_correlations_filtered.csv",
+    file_name=f"{st.session_state['sel_gene_step5']}_spearman_correlations_filtered.csv",
     mime="text/csv",
+    key="download_step6",
 )
 
-if st.button("Start over"):
-    for k in ["step", "filters", "filtered_samples", "chosen_vars", "id_col", "sel_gene", "min_pairs"]:
-        if k in st.session_state:
-            del st.session_state[k]
+if st.button("Start over", key="start_over"):
+    st.session_state.clear()
     st.session_state.step = 1
     st.rerun()
