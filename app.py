@@ -12,19 +12,31 @@ st.write(
     "Upload a **gzip-compressed expression matrix (.csv.gz)** where:\n"
     "- **Column 1** = gene names (e.g., Hugo_Symbol)\n"
     "- **Other columns** = samples\n\n"
-    "Then search for a gene and compute Spearman correlations against all other genes."
+    "Then search for a gene and compute Spearman correlations against all other genes.\n\n"
+    "Note: If your file contains duplicate gene names (common in probe-level data), the app collapses duplicates by **mean**."
 )
 
-# 🔒 Only allow csv.gz
+# Only allow .csv.gz uploads (gzip-compressed CSV)
 expr_file = st.file_uploader(
     "Upload expression matrix (.csv.gz only)",
-    type=["gz"]
+    type=["gz"],
 )
 
 @st.cache_data(show_spinner=False)
 def load_expression_gz(file_bytes: bytes) -> pd.DataFrame:
     df = pd.read_csv(io.BytesIO(file_bytes), compression="gzip")
-    df.iloc[:, 0] = df.iloc[:, 0].astype(str)
+
+    gene_col = df.columns[0]
+    df[gene_col] = df[gene_col].astype(str)
+
+    # Coerce sample columns to numeric; non-numeric -> NaN
+    sample_cols = df.columns[1:]
+    df[sample_cols] = df[sample_cols].apply(pd.to_numeric, errors="coerce")
+
+    # Collapse duplicate gene names by mean across samples (one row per gene)
+    # This prevents 2D indexing when selecting a gene that appears multiple times.
+    df = df.groupby(gene_col, as_index=False)[sample_cols].mean()
+
     return df
 
 def bh_qvalues(pvals: np.ndarray) -> np.ndarray:
@@ -36,24 +48,26 @@ def compute_spearman_all(
     selected_gene: str,
     min_pairs: int = 10,
 ) -> pd.DataFrame:
-
     sample_cols = df.columns[1:]
     mat = df.set_index(gene_col)
 
     if selected_gene not in mat.index:
         raise ValueError(f"Gene '{selected_gene}' not found in matrix.")
 
-    target = mat.loc[selected_gene, sample_cols].to_numpy(dtype=float)
+    # Ensure 1D vectors even if something unexpected happens
+    target = np.asarray(mat.loc[selected_gene, sample_cols], dtype=float).ravel()
 
     genes = mat.index.to_list()
     rhos, pvals, n_pairs = [], [], []
 
     for g in genes:
-        x = mat.loc[g, sample_cols].to_numpy(dtype=float)
+        x = np.asarray(mat.loc[g, sample_cols], dtype=float).ravel()
+
         mask = np.isfinite(target) & np.isfinite(x)
         n = int(mask.sum())
         n_pairs.append(n)
 
+        # Skip self and genes with too few paired samples
         if g == selected_gene or n < min_pairs:
             rhos.append(np.nan)
             pvals.append(np.nan)
@@ -70,18 +84,17 @@ def compute_spearman_all(
         "N_pairs": n_pairs,
     })
 
+    # BH correction on valid p-values only
     valid = res["p_value"].notna()
-    qvals = np.full(res.shape[0], np.nan)
+    qvals = np.full(res.shape[0], np.nan, dtype=float)
     if valid.sum() > 0:
-        qvals[valid.values] = bh_qvalues(res.loc[valid, "p_value"].values)
+        qvals[valid.values] = bh_qvalues(res.loc[valid, "p_value"].to_numpy(dtype=float))
 
     res["q_value"] = qvals
 
+    # Sort by |rho| then p-value
     res["abs_rho"] = res["Spearman_rho"].abs()
-    res = res.sort_values(
-        ["abs_rho", "p_value"],
-        ascending=[False, True]
-    ).drop(columns="abs_rho")
+    res = res.sort_values(["abs_rho", "p_value"], ascending=[False, True]).drop(columns="abs_rho")
 
     return res
 
@@ -93,16 +106,15 @@ if expr_file is None:
 df = load_expression_gz(expr_file.getvalue())
 
 gene_col = df.columns[0]
-genes = df[gene_col].tolist()
+genes = df[gene_col].astype(str).tolist()
 
-st.caption(
-    f"Genes: {df.shape[0]:,} • Samples: {df.shape[1]-1:,}"
-)
+st.caption(f"Genes (after collapsing duplicates): {df.shape[0]:,} • Samples: {df.shape[1]-1:,}")
 
 st.subheader("Search and select a gene")
 selected_gene = st.selectbox(
     "Type to search",
     options=genes,
+    index=0,
 )
 
 with st.sidebar:
@@ -135,3 +147,4 @@ st.download_button(
     file_name=f"{selected_gene}_spearman_correlations.csv",
     mime="text/csv",
 )
+
